@@ -16,7 +16,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/sectors') return handleSectors(ctx);
-    if (url.pathname === '/tasi') return handleTasi(url.searchParams.get('debug') === '1');
+    if (url.pathname === '/tasi') return handleTasi(ctx, url.searchParams.get('debug') === '1');
     return new Response(HTML, {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
     });
@@ -24,47 +24,76 @@ export default {
 };
 
 // ============================================================
-//  تاريخ تاسي: ياهو يرجع شمعة وحدة مع range، فنجرب عدة صيغ
+//  تاريخ تاسي من TradingView (ياهو يرجع شمعة وحدة للمؤشر)
 // ============================================================
-async function handleTasi(debug) {
+async function handleTasi(ctx, debug) {
   const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
-  const now = Math.floor(Date.now() / 1000);
-  const p1 = now - 6 * 365 * 86400;
-  const sym = encodeURIComponent('^TASI.SR');
-  const tries = [];
-  for (const host of ['query1', 'query2']) {
-    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&period1=' + p1 + '&period2=' + now);
-    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&period1=' + p1 + '&period2=' + now + '&events=history&includeAdjustedClose=true');
-    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&range=10y');
-    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&range=max');
+  const cache = caches.default;
+  const key = new Request('https://tasi-wave-cache.internal/tasi');
+  if (!debug) {
+    const hit = await cache.match(key);
+    if (hit) return new Response(await hit.text(), { headers: { ...headers, 'X-Cache': 'HIT' } });
   }
-  const log = [];
-  for (const u of tries) {
-    try {
-      const r = await fetch(u, { cf: { cacheTtl: 0 }, headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'Accept': 'application/json' } });
-      const d = await r.json();
-      const res = d && d.chart && d.chart.result && d.chart.result[0];
-      const q = res && res.indicators && res.indicators.quote && res.indicators.quote[0];
-      const ts = (res && res.timestamp) || [];
-      const b = { t: [], o: [], h: [], l: [], c: [] };
-      for (let i = 0; i < ts.length; i++) {
-        let o = q.open[i], h = q.high[i], l = q.low[i], c = q.close[i];
-        if (c == null && i === ts.length - 1 && res.meta) {
-          c = res.meta.regularMarketPrice; h = h ?? res.meta.regularMarketDayHigh ?? c; l = l ?? res.meta.regularMarketDayLow ?? c; o = o ?? c;
-        }
-        if (o == null || h == null || l == null || c == null) continue;
-        b.t.push(ts[i] * 1000); b.o.push(o); b.h.push(h); b.l.push(l); b.c.push(c);
-      }
-      log.push({ url: u.replace(/^https:\/\//, ''), status: r.status, bars: b.c.length });
-      if (b.c.length >= 200) {
-        return new Response(JSON.stringify(debug ? { ok: true, log } : { source: u, bars: b }), { headers });
-      }
-    } catch (e) {
-      log.push({ url: u.replace(/^https:\/\//, ''), error: String(e) });
+  try {
+    const raw = await tvBars('TADAWUL:TASI', 1500);
+    const b = { t: [], o: [], h: [], l: [], c: [] };
+    for (const x of raw || []) {
+      const v = x.v;
+      if (!v || v.length < 5 || v.slice(0, 5).some(n => n == null)) continue;
+      b.t.push(v[0] * 1000); b.o.push(v[1]); b.h.push(v[2]); b.l.push(v[3]); b.c.push(v[4]);
     }
+    if (b.c.length < 200) throw new Error('only ' + b.c.length + ' bars');
+    const payload = JSON.stringify(debug
+      ? { ok: true, source: 'tradingview', bars: b.c.length, first: new Date(b.t[0]).toISOString().slice(0, 10),
+          last: new Date(b.t[b.t.length - 1]).toISOString().slice(0, 10), lastClose: b.c[b.c.length - 1] }
+      : { source: 'tradingview', bars: b });
+    if (!debug) ctx.waitUntil(cache.put(key, new Response(payload, {
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=600' } })));
+    return new Response(payload, { headers });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'no TASI history', detail: String(e) }), { status: 502, headers });
   }
-  return new Response(JSON.stringify({ error: 'no TASI history', log }), { status: 502, headers });
+}
+
+// اتصال WebSocket بخادم بيانات TradingView (بدون تسجيل دخول)
+async function tvBars(symbol, count) {
+  const resp = await fetch('https://data.tradingview.com/socket.io/websocket?from=chart%2F&type=chart', {
+    headers: { 'Upgrade': 'websocket', 'Origin': 'https://www.tradingview.com',
+               'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
+  });
+  const ws = resp.webSocket;
+  if (!ws) throw new Error('websocket refused, HTTP ' + resp.status);
+  ws.accept();
+  const frame = (str) => '~m~' + str.length + '~m~' + str;
+  const send = (m, p) => ws.send(frame(JSON.stringify({ m, p })));
+
+  return new Promise((resolve, reject) => {
+    let bars = null, done = false;
+    const finish = (err) => {
+      if (done) return; done = true; clearTimeout(timer);
+      try { ws.close(); } catch (e) {}
+      if (bars) resolve(bars); else reject(err || new Error('no data'));
+    };
+    const timer = setTimeout(() => finish(new Error('timeout')), 15000);
+    ws.addEventListener('message', (ev) => {
+      const data = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
+      for (const part of data.split(/~m~\d+~m~/)) {
+        if (!part) continue;
+        if (part.startsWith('~h~')) { ws.send(frame(part)); continue; }
+        let j; try { j = JSON.parse(part); } catch (e) { continue; }
+        if (j.m === 'timescale_update' && j.p && j.p[1] && j.p[1].sds_1 && j.p[1].sds_1.s) bars = j.p[1].sds_1.s;
+        else if (j.m === 'series_completed') finish();
+        else if (j.m === 'symbol_error' || j.m === 'series_error' || j.m === 'critical_error' || j.m === 'protocol_error')
+          finish(new Error(j.m + ' ' + JSON.stringify(j.p)));
+      }
+    });
+    ws.addEventListener('close', () => finish(new Error('socket closed')));
+    ws.addEventListener('error', () => finish(new Error('socket error')));
+    send('set_auth_token', ['unauthorized_user_token']);
+    send('chart_create_session', ['cs_wave', '']);
+    send('resolve_symbol', ['cs_wave', 'sds_sym_1', '=' + JSON.stringify({ symbol, adjustment: 'splits', session: 'regular' })]);
+    send('create_series', ['cs_wave', 'sds_1', 's1', 'sds_sym_1', '1D', count, '']);
+  });
 }
 
 async function handleSectors(ctx) {
