@@ -16,11 +16,56 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/sectors') return handleSectors(ctx);
+    if (url.pathname === '/tasi') return handleTasi(url.searchParams.get('debug') === '1');
     return new Response(HTML, {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
     });
   },
 };
+
+// ============================================================
+//  تاريخ تاسي: ياهو يرجع شمعة وحدة مع range، فنجرب عدة صيغ
+// ============================================================
+async function handleTasi(debug) {
+  const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+  const now = Math.floor(Date.now() / 1000);
+  const p1 = now - 6 * 365 * 86400;
+  const sym = encodeURIComponent('^TASI.SR');
+  const tries = [];
+  for (const host of ['query1', 'query2']) {
+    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&period1=' + p1 + '&period2=' + now);
+    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&period1=' + p1 + '&period2=' + now + '&events=history&includeAdjustedClose=true');
+    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&range=10y');
+    tries.push('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&range=max');
+  }
+  const log = [];
+  for (const u of tries) {
+    try {
+      const r = await fetch(u, { cf: { cacheTtl: 0 }, headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'Accept': 'application/json' } });
+      const d = await r.json();
+      const res = d && d.chart && d.chart.result && d.chart.result[0];
+      const q = res && res.indicators && res.indicators.quote && res.indicators.quote[0];
+      const ts = (res && res.timestamp) || [];
+      const b = { t: [], o: [], h: [], l: [], c: [] };
+      for (let i = 0; i < ts.length; i++) {
+        let o = q.open[i], h = q.high[i], l = q.low[i], c = q.close[i];
+        if (c == null && i === ts.length - 1 && res.meta) {
+          c = res.meta.regularMarketPrice; h = h ?? res.meta.regularMarketDayHigh ?? c; l = l ?? res.meta.regularMarketDayLow ?? c; o = o ?? c;
+        }
+        if (o == null || h == null || l == null || c == null) continue;
+        b.t.push(ts[i] * 1000); b.o.push(o); b.h.push(h); b.l.push(l); b.c.push(c);
+      }
+      log.push({ url: u.replace(/^https:\/\//, ''), status: r.status, bars: b.c.length });
+      if (b.c.length >= 200) {
+        return new Response(JSON.stringify(debug ? { ok: true, log } : { source: u, bars: b }), { headers });
+      }
+    } catch (e) {
+      log.push({ url: u.replace(/^https:\/\//, ''), error: String(e) });
+    }
+  }
+  return new Response(JSON.stringify({ error: 'no TASI history', log }), { status: 502, headers });
+}
 
 async function handleSectors(ctx) {
   const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
@@ -254,6 +299,12 @@ function fetchBars(ticker, range) {
   }).catch(function () { return null; });
 }
 
+function fetchTasi() {
+  return fetch('/tasi', { cache: 'no-store' }).then(function (r) { return r.json(); })
+    .then(function (d) { return d && d.bars && d.bars.c.length ? d.bars : null; })
+    .catch(function () { return null; });
+}
+
 function fetchSymbols() {
   return fetch(PROXY + '/symbols').then(function (r) { return r.json(); })
     .then(function (d) { return d && d.symbols && d.symbols.length ? d.symbols : null; })
@@ -347,9 +398,9 @@ function scan() {
   $('progText').textContent = 'جاري جلب تاسي والقطاعات…';
   $('progBar').style.width = '0';
 
-  Promise.all([fetchBars(TASI_TICKER, '5y'), fetchSymbols(), fetchSectors()]).then(function (res) {
+  Promise.all([fetchTasi(), fetchSymbols(), fetchSectors()]).then(function (res) {
     var tasiBars = res[0], symbols = res[1], sectors = res[2];
-    if (!tasiBars || tasiBars.c.length <= p.rngLen + 2) throw new Error('تعذر جلب بيانات تاسي من البروكسي');
+    if (!tasiBars || tasiBars.c.length <= p.rngLen + 2) throw new Error('تعذر جلب تاريخ تاسي (افتح /tasi?debug=1 للتفاصيل)');
     var tasi = simTasi(tasiBars, p);
     renderMarket(tasi, p);
 
