@@ -203,6 +203,13 @@ const HTML = String.raw`<!DOCTYPE html>
   td { padding:10px; border-top:1px solid var(--line); white-space:nowrap; }
   tr.pick td { background:rgba(41,98,255,.10); }
   tr.pick td:first-child { box-shadow:inset -3px 0 0 var(--blue); }
+  tr.sens td { background:rgba(156,39,176,.12); }
+  tr.sens td:first-child { box-shadow:inset -3px 0 0 #ab47bc; }
+  .br { display:inline-block; background:rgba(171,71,188,.22); color:#ce93d8; border:1px solid rgba(171,71,188,.5);
+        border-radius:5px; padding:1px 6px; font-size:12px; font-weight:600; font-style:italic; margin-right:4px; }
+  th.sort { cursor:pointer; user-select:none; }
+  th.sort.on { color:var(--white); }
+  .legend { color:var(--muted); font-size:13px; margin-top:10px; line-height:1.7; }
   .sym b { color:var(--white); }
   .sym small { display:block; color:var(--muted); font-size:12px; max-width:180px; overflow:hidden; text-overflow:ellipsis; }
   .num { font-variant-numeric:tabular-nums; }
@@ -244,6 +251,12 @@ const HTML = String.raw`<!DOCTYPE html>
       <label>فترة متوسط السيولة (أيام)<input type="number" id="liqLen" value="20"></label>
       <label>أدنى متوسط قيمة تداول (مليون)<input type="number" id="minValueM" value="15"></label>
     </div>
+    <h3>اختيار الحساسية βr</h3>
+    <div class="grid">
+      <label>أدنى بيتا β<input type="number" id="minBeta" value="1" step="0.1"></label>
+      <label>أدنى ارتباط r<input type="number" id="minCorr" value="0.5" step="0.05"></label>
+      <label>فترة الحساب (أيام)<input type="number" id="betaLen" value="120"></label>
+    </div>
   </div>
 
   <div class="progress" id="progress"><span id="progText">جاري الفحص…</span><div class="bar"><div id="progBar"></div></div></div>
@@ -254,6 +267,7 @@ const HTML = String.raw`<!DOCTYPE html>
   <div class="filters" id="filters">
     <button data-f="all" class="on">الكل</button>
     <button data-f="pick">المختارة ⭐</button>
+    <button data-f="sens">الحساسية βr</button>
     <button data-f="top">أعلى 20</button>
   </div>
   <div class="summary" id="summary"></div>
@@ -261,12 +275,16 @@ const HTML = String.raw`<!DOCTYPE html>
   <div class="tablebox" id="tablebox">
     <table>
       <thead><tr>
-        <th>#</th><th>السهم</th><th>القطاع</th><th>السعر</th><th>متوسط السيولة</th>
-        <th>وقف الحساب</th><th>البُعد عن الوقف</th><th>الكمية</th><th>قيمة المركز</th><th>الحالة</th>
+        <th class="sort" data-k="rank">#</th><th>السهم</th><th>القطاع</th>
+        <th class="sort" data-k="beta">β</th><th class="sort" data-k="corr">r</th>
+        <th class="sort" data-k="close">السعر</th><th class="sort" data-k="avgValue">متوسط السيولة</th>
+        <th class="sort" data-k="sStop">وقف الحساب</th><th class="sort" data-k="distPct">البُعد عن الوقف</th>
+        <th class="sort" data-k="qty">الكمية</th><th class="sort" data-k="posValue">قيمة المركز</th><th>الحالة</th>
       </tr></thead>
       <tbody id="tbody"></tbody>
     </table>
   </div>
+  <div class="legend" id="legend" style="display:none">β البيتا، r الارتباط بالسوق — آخر <span id="legLen">120</span> يوم | اضغط على رأس أي عمود للترتيب، ومرة ثانية لعكسه | ⭐ الاختيار الرسمي، <span class="br">βr</span> اختيار الحساسية</div>
 </div>
 
 <script>
@@ -285,6 +303,8 @@ var SECTOR_AR = {
 
 var rows = [];
 var currentFilter = 'all';
+var sortKey = 'rank', sortDesc = false;
+var tasiByDate = null;
 
 function $(id) { return document.getElementById(id); }
 function num(id) { return parseFloat($(id).value); }
@@ -300,13 +320,23 @@ Array.prototype.forEach.call(document.querySelectorAll('#filters button'), funct
   };
 });
 
+Array.prototype.forEach.call(document.querySelectorAll('th.sort'), function (h) {
+  h.onclick = function () {
+    var k = h.getAttribute('data-k');
+    if (k === sortKey) sortDesc = !sortDesc;
+    else { sortKey = k; sortDesc = k !== 'rank'; }
+    renderTable();
+  };
+});
+
 function getParams() {
   return {
     rngLen: num('rngLen'), zonePct: num('zonePct'), minRange: num('minRange'),
     touchBars: num('touchBars'), stopLook: num('stopLook'), stopBuf: num('stopBuf'),
     capital: num('capital'), totalRisk: num('totalRisk'), nStocks: Math.max(1, Math.round(num('nStocks'))),
     sStopLook: num('sStopLook'), sStopBuf: num('sStopBuf'),
-    topN: Math.round(num('topN')), liqLen: Math.round(num('liqLen')), minValue: num('minValueM') * 1e6
+    topN: Math.round(num('topN')), liqLen: Math.round(num('liqLen')), minValue: num('minValueM') * 1e6,
+    minBeta: num('minBeta'), minCorr: num('minCorr'), betaLen: Math.round(num('betaLen'))
   };
 }
 
@@ -414,8 +444,45 @@ function calcStock(b, p) {
   var qtyRisk = riskPS > 0 ? Math.floor(riskPer / riskPS) : 0;
   var qtyCap = Math.floor(p.capital / p.nStocks / close);
   var qty = Math.min(qtyRisk, qtyCap);
+  var bc = betaCorr(b, p.betaLen);
   return { close: close, avgValue: avgValue, sStop: sStop, distPct: riskPS / close * 100,
-           qty: qty, posValue: qty * close, liqOk: avgValue >= p.minValue, t: b.t[i] };
+           qty: qty, posValue: qty * close, liqOk: avgValue >= p.minValue, t: b.t[i],
+           beta: bc ? bc.beta : null, corr: bc ? bc.corr : null };
+}
+
+// ───────── البيتا والارتباط (مطابقة v2: عوائد يومية، ta.correlation و ta.stdev) ─────────
+function dayKey(t) { return new Date(t + 3 * 3600000).toISOString().slice(0, 10); }
+function buildTasiIndex(tb) {
+  var keys = [], closes = [];
+  for (var i = 0; i < tb.t.length; i++) { keys.push(dayKey(tb.t[i])); closes.push(tb.c[i]); }
+  return { keys: keys, closes: closes };
+}
+function tasiCloseAt(key) {
+  var a = tasiByDate.keys, lo = 0, hi = a.length - 1, ans = -1;
+  while (lo <= hi) { var m = (lo + hi) >> 1; if (a[m] <= key) { ans = m; lo = m + 1; } else hi = m - 1; }
+  return ans < 0 ? null : tasiByDate.closes[ans];
+}
+function betaCorr(b, n) {
+  if (!tasiByDate || b.c.length < n + 1) return null;
+  var rs = [], rm = [], prevM = null;
+  var start = b.c.length - n - 1;
+  for (var i = start; i < b.c.length; i++) {
+    var m = tasiCloseAt(dayKey(b.t[i]));
+    if (i > start) {
+      if (m == null || prevM == null) return null;
+      rs.push(b.c[i] / b.c[i - 1] - 1);
+      rm.push(m / prevM - 1);
+    }
+    prevM = m;
+  }
+  var ms = 0, mm = 0;
+  for (var k = 0; k < n; k++) { ms += rs[k]; mm += rm[k]; }
+  ms /= n; mm /= n;
+  var cov = 0, vs = 0, vm = 0;
+  for (k = 0; k < n; k++) { var a = rs[k] - ms, c = rm[k] - mm; cov += a * c; vs += a * a; vm += c * c; }
+  if (vs === 0 || vm === 0) return null;
+  var corr = cov / Math.sqrt(vs * vm);
+  return { corr: corr, beta: corr * Math.sqrt(vs / n) / Math.sqrt(vm / n) };
 }
 
 // ───────── الفحص ─────────
@@ -431,6 +498,7 @@ function scan() {
     var tasiBars = res[0], symbols = res[1], sectors = res[2];
     if (!tasiBars || tasiBars.c.length <= p.rngLen + 2) throw new Error('تعذر جلب تاريخ تاسي (افتح /tasi?debug=1 للتفاصيل)');
     var tasi = simTasi(tasiBars, p);
+    tasiByDate = buildTasiIndex(tasiBars);
     renderMarket(tasi, p);
 
     if (!symbols) symbols = Object.keys(sectors).filter(function (c) {
@@ -442,7 +510,7 @@ function scan() {
     function worker() {
       if (idx >= total) return Promise.resolve();
       var sym = symbols[idx++];
-      return fetchBars(sym, '6mo').then(function (b) {
+      return fetchBars(sym, '1y').then(function (b) {
         var r = b ? calcStock(b, p) : null;
         if (r) {
           var code = sym.replace('.SR', '');
@@ -483,11 +551,23 @@ function finish(list, p, haveSectors) {
       if (!used[key]) { used[key] = true; r.pick = true; picks++; }
     }
   });
+  var usedS = {}, sPicks = 0;
+  list.forEach(function (r) {
+    r.sens = false;
+    var sensOk = r.beta != null && r.corr != null && r.beta >= p.minBeta && r.corr >= p.minCorr;
+    if (r.top && sPicks < p.nStocks && r.liqOk && r.qty > 0 && sensOk) {
+      var key = haveSectors ? r.sectorEn || ('_' + r.code) : ('_' + r.code);
+      if (!usedS[key]) { usedS[key] = true; r.sens = true; sPicks++; }
+    }
+  });
   rows = list;
-  var tot = 0;
-  list.forEach(function (r) { if (r.pick) tot += r.posValue; });
-  $('summary').textContent = 'تم فحص ' + list.length + ' سهم | المختارة: ' + picks +
-    ' | مجموع قيمة المراكز: ' + fmt(tot, 0) + ' ريال' +
+  var tot = 0, totS = 0;
+  list.forEach(function (r) { if (r.pick) tot += r.posValue; if (r.sens) totS += r.posValue; });
+  $('legLen').textContent = p.betaLen;
+  $('legend').style.display = 'block';
+  $('summary').textContent = 'تم فحص ' + list.length + ' سهم | ⭐ المختارة: ' + picks + ' بقيمة ' + fmt(tot, 0) +
+    ' ريال | βr الحساسية: ' + sPicks + ' بقيمة ' + fmt(totS, 0) + ' ريال' +
+    (sPicks < p.nStocks ? ' (أقل من ' + p.nStocks + ' أسهم تحقق الشرط ضمن أعلى ' + p.topN + ')' : '') +
     (haveSectors ? '' : ' | ⚠️ تعذر جلب القطاعات، الاختيار بالسيولة فقط');
   $('filters').style.display = 'flex';
   $('tablebox').style.display = 'block';
@@ -560,24 +640,50 @@ function tasiBarsTime(tasi) { var w = tasi.waves[tasi.waves.length - 1]; return 
 
 function renderTable() {
   var list = rows.filter(function (r) {
-    return currentFilter === 'all' || (currentFilter === 'pick' && r.pick) || (currentFilter === 'top' && r.top);
+    return currentFilter === 'all' || (currentFilter === 'pick' && r.pick) ||
+           (currentFilter === 'sens' && r.sens) || (currentFilter === 'top' && r.top);
   });
+  var show = function (r) { return r.pick || r.sens; };
+  var val = function (r) {
+    if ((sortKey === 'sStop' || sortKey === 'distPct' || sortKey === 'qty' || sortKey === 'posValue') && !show(r)) return null;
+    return r[sortKey];
+  };
+  list.sort(function (a, b) {
+    var x = val(a), y = val(b);
+    if (x == null && y == null) return a.rank - b.rank;
+    if (x == null) return 1;
+    if (y == null) return -1;
+    return sortDesc ? y - x : x - y;
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('th.sort'), function (h) {
+    var base = h.getAttribute('data-base') || h.textContent;
+    h.setAttribute('data-base', base);
+    var on = h.getAttribute('data-k') === sortKey;
+    h.classList.toggle('on', on);
+    h.textContent = base + (on ? (sortDesc ? ' ↓' : ' ↑') : '');
+  });
+  var dash = '<span class="muted">—</span>';
   var html = '';
   list.forEach(function (r) {
-    var status = r.pick ? '⭐ مختار' : r.top ? (r.liqOk ? 'أعلى 20' : 'أعلى 20 — سيولة أقل من الحد') : '—';
-    html += '<tr class="' + (r.pick ? 'pick' : '') + '">' +
+    var badge = '<span class="br">βr</span>';
+    var status = r.pick && r.sens ? '⭐ ' + badge : r.pick ? '⭐ مختار' : r.sens ? badge :
+                 r.top ? (r.liqOk ? 'أعلى 20' : 'أعلى 20 — سيولة أقل من الحد') : '—';
+    var cls = r.pick ? 'pick' : r.sens ? 'sens' : '';
+    html += '<tr class="' + cls + '">' +
       '<td class="num muted">' + r.rank + '</td>' +
-      '<td class="sym"><b>' + r.code + '</b><small>' + r.name + '</small></td>' +
+      '<td class="sym"><b>' + r.code + '</b>' + (r.sens ? badge : '') + '<small>' + r.name + '</small></td>' +
       '<td>' + r.sector + '</td>' +
+      '<td class="num">' + (r.beta == null ? dash : fmt(r.beta, 2)) + '</td>' +
+      '<td class="num">' + (r.corr == null ? dash : fmt(r.corr, 2)) + '</td>' +
       '<td class="num">' + fmt(r.close, 2) + '</td>' +
       '<td class="num">' + fmt(r.avgValue / 1e6, 1) + ' م</td>' +
-      '<td class="num">' + (r.pick ? fmt(r.sStop, 2) : '<span class="muted">—</span>') + '</td>' +
-      '<td class="num">' + (r.pick ? fmt(r.distPct, 1) + '%' : '<span class="muted">—</span>') + '</td>' +
-      '<td class="num">' + (r.pick ? fmt(r.qty, 0) : '<span class="muted">—</span>') + '</td>' +
-      '<td class="num">' + (r.pick ? fmt(r.posValue, 0) : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + (show(r) ? fmt(r.sStop, 2) : dash) + '</td>' +
+      '<td class="num">' + (show(r) ? fmt(r.distPct, 1) + '%' : dash) + '</td>' +
+      '<td class="num">' + (show(r) ? fmt(r.qty, 0) : dash) + '</td>' +
+      '<td class="num">' + (show(r) ? fmt(r.posValue, 0) : dash) + '</td>' +
       '<td>' + status + '</td></tr>';
   });
-  $('tbody').innerHTML = html || '<tr><td colspan="10" class="muted">لا توجد أسهم في هذا الفلتر.</td></tr>';
+  $('tbody').innerHTML = html || '<tr><td colspan="12" class="muted">لا توجد أسهم في هذا الفلتر.</td></tr>';
 }
 </script>
 </body>
