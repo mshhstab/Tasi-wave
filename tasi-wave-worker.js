@@ -29,13 +29,13 @@ export default {
 async function handleTasi(ctx, debug) {
   const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
   const cache = caches.default;
-  const key = new Request('https://tasi-wave-cache.internal/tasi');
+  const key = new Request('https://tasi-wave-cache.internal/tasi-max');
   if (!debug) {
     const hit = await cache.match(key);
     if (hit) return new Response(await hit.text(), { headers: { ...headers, 'X-Cache': 'HIT' } });
   }
   try {
-    const raw = await tvBars('TADAWUL:TASI', 1500);
+    const raw = await tvBars('TADAWUL:TASI', 20000); // أقصى تاريخ يسمح فيه TradingView
     const b = { t: [], o: [], h: [], l: [], c: [] };
     for (const x of raw || []) {
       const v = x.v;
@@ -191,6 +191,11 @@ const HTML = String.raw`<!DOCTYPE html>
   .ok { color:var(--green); } .no { color:var(--red); }
   .waves { margin-top:14px; font-size:13px; color:var(--muted); }
   .waves table { margin-top:6px; }
+  .w-ctl { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:6px; }
+  .w-ctl input[type=range] { flex:1; min-width:160px; accent-color:var(--blue); }
+  .w-ctl b { color:var(--white); font-variant-numeric:tabular-nums; }
+  .w-sum { margin-top:6px; }
+  .w-list { max-height:360px; overflow-y:auto; }
 
   .filters { display:none; gap:8px; margin-top:20px; flex-wrap:wrap; }
   .filters button { background:var(--panel); color:var(--text); border:1px solid var(--line2); padding:8px 14px; font-size:14px; }
@@ -305,6 +310,8 @@ var rows = [];
 var currentFilter = 'all';
 var sortKey = 'rank', sortDesc = false;
 var tasiByDate = null;
+var lastTasi = null, wavesYears = 1;
+var YEAR_MS = 365.25 * 86400000;
 
 function $(id) { return document.getElementById(id); }
 function num(id) { return parseFloat($(id).value); }
@@ -426,7 +433,7 @@ function simTasi(b, p) {
              entryIdx: entryIdx, close: b.c[i], t: b.t[i] };
   }
   if (last && last.pos) waves.push({ inT: b.t[entryIdx], inP: b.c[entryIdx], outT: null, outP: last.close, why: 0 });
-  return { last: last, waves: waves };
+  return { last: last, waves: waves, firstT: b.t[Math.min(p.rngLen, n - 1)] };
 }
 
 // ───────── حسابات السهم (مطابقة Wave Stock v2) ─────────
@@ -603,17 +610,17 @@ function renderMarket(tasi, p) {
   }
   var posPct = Math.max(0, Math.min(100, (L.close - L.rL) / (L.rH - L.rL) * 100));
 
+  // سلايدر الموجات: من آخر سنة إلى أقصى عدد سنوات متاح في تاريخ تاسي
+  lastTasi = tasi;
+  var maxYears = Math.max(1, Math.ceil((L.t - tasi.firstT) / YEAR_MS));
+  wavesYears = Math.min(Math.max(1, wavesYears), maxYears);
   var wavesHtml = '';
-  var w = tasi.waves.slice(-4).reverse();
-  if (w.length) {
-    wavesHtml = '<div class="waves">آخر الموجات على تاسي<table><thead><tr><th>الدخول</th><th>الخروج</th><th>السبب</th><th>التغير</th></tr></thead><tbody>';
-    w.forEach(function (x) {
-      var ch = (x.outP / x.inP - 1) * 100;
-      wavesHtml += '<tr><td>' + dstr(x.inT) + '</td><td>' + (x.outT ? dstr(x.outT) : 'مفتوحة') + '</td><td>' +
-        (x.why === 1 ? 'وقف' : x.why === 2 ? 'سقف' : '—') + '</td><td class="num ' + (ch >= 0 ? 'ok' : 'no') + '">' +
-        (ch >= 0 ? '+' : '') + fmt(ch, 1) + '%</td></tr>';
-    });
-    wavesHtml += '</tbody></table></div>';
+  if (tasi.waves.length) {
+    wavesHtml = '<div class="waves">موجات تاسي' +
+      '<div class="w-ctl"><label for="wYears">آخر</label>' +
+      '<input type="range" id="wYears" min="1" max="' + maxYears + '" step="1" value="' + wavesYears + '">' +
+      '<b id="wYearsLbl"></b><span class="muted">(المتاح ' + maxYears + ' سنة)</span></div>' +
+      '<div class="w-sum" id="wSum"></div><div class="w-list" id="wList"></div></div>';
   }
 
   $('market').innerHTML =
@@ -635,6 +642,34 @@ function renderMarket(tasi, p) {
       '<div class="chk">في منطقة السقف ' + mark(L.touchedC) + '</div>' +
     '</div>' + wavesHtml;
   $('market').style.display = 'block';
+  if (tasi.waves.length) {
+    $('wYears').oninput = function () { wavesYears = parseInt(this.value, 10); renderWaves(); };
+    renderWaves();
+  }
+}
+
+function renderWaves() {
+  var L = lastTasi.last, from = L.t - wavesYears * YEAR_MS;
+  var w = lastTasi.waves.filter(function (x) { return x.inT >= from; }).reverse();
+  $('wYearsLbl').textContent = wavesYears === 1 ? 'سنة' : wavesYears === 2 ? 'سنتين' : wavesYears + ' سنوات';
+  var wins = 0, comp = 1;
+  w.forEach(function (x) { var r = x.outP / x.inP; if (r >= 1) wins++; comp *= r; });
+  $('wSum').innerHTML = w.length
+    ? 'عدد الموجات: <b>' + w.length + '</b> | الرابحة: <b>' + wins + '</b> (' + fmt(wins / w.length * 100, 0) + '%)' +
+      ' | العائد التراكمي: <b class="' + (comp >= 1 ? 'ok' : 'no') + '">' + (comp >= 1 ? '+' : '') + fmt((comp - 1) * 100, 1) + '%</b>'
+    : 'لا توجد موجات في هذه الفترة.';
+  var html = '';
+  if (w.length) {
+    html = '<table><thead><tr><th>الدخول</th><th>الخروج</th><th>السبب</th><th>التغير</th></tr></thead><tbody>';
+    w.forEach(function (x) {
+      var ch = (x.outP / x.inP - 1) * 100;
+      html += '<tr><td>' + dstr(x.inT) + '</td><td>' + (x.outT ? dstr(x.outT) : 'مفتوحة') + '</td><td>' +
+        (x.why === 1 ? 'وقف' : x.why === 2 ? 'سقف' : '—') + '</td><td class="num ' + (ch >= 0 ? 'ok' : 'no') + '">' +
+        (ch >= 0 ? '+' : '') + fmt(ch, 1) + '%</td></tr>';
+    });
+    html += '</tbody></table>';
+  }
+  $('wList').innerHTML = html;
 }
 function tasiBarsTime(tasi) { var w = tasi.waves[tasi.waves.length - 1]; return w ? w.inT : null; }
 
